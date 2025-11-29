@@ -18,14 +18,25 @@ import javafx.util.converter.IntegerStringConverter;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.control.TextArea;
+import javafx.scene.control.ButtonType;
+import javafx.scene.control.TextField;
 import javafx.print.PrinterJob;
+import javafx.animation.KeyFrame;
+import javafx.animation.Timeline;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.DriverManager;
 import javafx.stage.Modality;
-import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
+import javafx.scene.layout.Region;
+import javafx.scene.control.TableRow;
 import javafx.scene.layout.VBox;
 import javafx.stage.Stage;
 
 public class CoffeeShopCashier {
+	private String currentCashier = "CASHIER"; // default, set using setCurrentCashier
+	public void setCurrentCashier(String username) { this.currentCashier = username; }
 
 	public static class CartItem {
 		private final SimpleIntegerProperty foodId = new SimpleIntegerProperty();
@@ -82,17 +93,38 @@ public class CoffeeShopCashier {
 		HBox.setHgrow(spacer, Priority.ALWAYS);
 
 		topBar.getChildren().addAll(backBtn, title, spacer);
-
+					// earlier pref width moved to rightBox declaration
 		// Left: menu buttons (loaded from DB)
 		VBox menuBox = new VBox(10);
 		menuBox.setPadding(new Insets(10));
-		menuBox.setPrefWidth(260);
+		menuBox.setPrefWidth(300);
+		// Make menuBox stretch full height of the content area
+		menuBox.setPrefHeight(Double.MAX_VALUE);
 		menuBox.getStyleClass().add("sidebar");
 
 		Label menuLabel = new Label("Menu Items");
 		menuLabel.setStyle("-fx-font-weight: bold;");
-		menuLabel.getStyleClass().add("card-title");
-		menuBox.getChildren().add(menuLabel);
+		menuLabel.getStyleClass().addAll("card-title", "menu-header");
+		// center the label (wrap in HBox for reliable centering)
+		javafx.scene.layout.HBox menuHeaderBox = new javafx.scene.layout.HBox(menuLabel);
+		menuHeaderBox.setAlignment(Pos.CENTER);
+		menuHeaderBox.setMaxWidth(Double.MAX_VALUE);
+		// Search box + scrollable flow of menu items
+		TextField menuSearch = new TextField();
+		menuSearch.setPromptText("Search menu...");
+		menuSearch.getStyleClass().add("login-field");
+		// Vertical stacked menu so it looks like a handwritten menu list
+		javafx.scene.layout.VBox flow = new javafx.scene.layout.VBox(10);
+		flow.setPadding(new Insets(8));
+		javafx.scene.control.ScrollPane scrollMenu = new javafx.scene.control.ScrollPane(flow);
+		scrollMenu.setFitToWidth(true);
+		// Allow scrollMenu to expand and fill the left column vertically
+		scrollMenu.setFitToWidth(true);
+		scrollMenu.setFitToHeight(true);
+		scrollMenu.setMaxHeight(Double.MAX_VALUE);
+		VBox.setVgrow(scrollMenu, Priority.ALWAYS);
+		java.util.List<Button> menuButtons = new java.util.ArrayList<>();
+		menuBox.getChildren().addAll(menuHeaderBox, menuSearch, scrollMenu);
 
 		// Center: cart as TableView with columns Item, Qty, UnitPrice, Total
 		VBox centerBox = new VBox(10);
@@ -114,11 +146,15 @@ public class CoffeeShopCashier {
 
 		TableColumn<CartItem, Double> unitCol = new TableColumn<>("Unit");
 		unitCol.setCellValueFactory(new PropertyValueFactory<>("unitPrice"));
-		unitCol.setPrefWidth(80);
+		unitCol.setPrefWidth(90);
+		// align numbers to the right
+		unitCol.setStyle("-fx-alignment: CENTER-RIGHT;");
 
 		TableColumn<CartItem, Double> totalCol = new TableColumn<>("Total");
 		totalCol.setCellValueFactory(new PropertyValueFactory<>("total"));
-		totalCol.setPrefWidth(100);
+		totalCol.setPrefWidth(120);
+		// align numbers to the right
+		totalCol.setStyle("-fx-alignment: CENTER-RIGHT;");
 
 		cartTable.getColumns().add(itemCol);
 		cartTable.getColumns().add(qtyCol);
@@ -141,10 +177,61 @@ public class CoffeeShopCashier {
 
 		centerBox.getChildren().addAll(cartLabel, cartTable);
 
+		// Pending bills for this cashier
+		Label pendingLabel = new Label("Pending Orders (Kitchen)");
+		TableView<java.util.Map<String, Object>> pendingTable = new TableView<>();
+		TableColumn<java.util.Map<String, Object>, String> pbIdCol = new TableColumn<>("Bill ID");
+		pbIdCol.setCellValueFactory(c -> new javafx.beans.property.SimpleStringProperty(String.valueOf(c.getValue().get("id"))));
+		TableColumn<java.util.Map<String, Object>, String> pbTableCol = new TableColumn<>("Table");
+		pbTableCol.setCellValueFactory(c -> new javafx.beans.property.SimpleStringProperty(String.valueOf(c.getValue().get("table_number"))));
+		TableColumn<java.util.Map<String, Object>, String> pbPending = new TableColumn<>("Pending Items");
+		pbPending.setCellValueFactory(c -> new javafx.beans.property.SimpleStringProperty(String.valueOf(c.getValue().get("pending"))));
+		TableColumn<java.util.Map<String, Object>, String> pbTotal = new TableColumn<>("Total");
+		pbTotal.setCellValueFactory(c -> new javafx.beans.property.SimpleStringProperty(String.valueOf(c.getValue().get("total"))));
+		pendingTable.getColumns().addAll(java.util.Arrays.asList(pbIdCol, pbTableCol, pbPending, pbTotal));
+		pendingTable.setPrefHeight(140);
+		Button refreshPendingBtn = new Button("Refresh");
+		refreshPendingBtn.setOnAction(ev -> loadPendingBillsForCashier(pendingTable));
+		// move pending table to the right panel instead of center
+		// double click a pending bill to show its items
+		pendingTable.setRowFactory(tv -> {
+			TableRow<java.util.Map<String,Object>> row = new TableRow<>();
+			row.setOnMouseClicked(ev -> {
+				if (!row.isEmpty() && ev.getClickCount() == 2) {
+					java.util.Map<String,Object> item = row.getItem();
+					String billId = String.valueOf(item.get("id"));
+					// query items for bill
+					StringBuilder sb = new StringBuilder();
+					String sql = "SELECT bi.qty, bi.unit_price, f.fName FROM bill_items bi JOIN food f ON bi.food_id = f.id WHERE bi.bill_id = ?";
+					try (Connection c = DriverManager.getConnection("jdbc:mysql://localhost:3306/restaurant?serverTimezone=UTC", "root", "")) {
+						try (PreparedStatement ps = c.prepareStatement(sql)) {
+							ps.setString(1, billId);
+							try (ResultSet rs = ps.executeQuery()) {
+								while (rs.next()) {
+									sb.append(rs.getString("fName")).append(" - qty: ").append(rs.getInt("qty")).append("\n");
+								}
+							}
+						}
+					} catch (Exception ex) { ex.printStackTrace(); sb.append("Could not load items: "+ex.getMessage()); }
+					Alert a = new Alert(Alert.AlertType.INFORMATION, sb.toString(), ButtonType.OK);
+					a.setTitle("Bill Items: " + billId);
+					a.setHeaderText("Items for bill " + billId);
+					a.showAndWait();
+				}
+			});
+			return row;
+		});
+		// initial load
+		loadPendingBillsForCashier(pendingTable);
+		// auto refresh for pending bills
+		Timeline pendRefresh = new Timeline(new KeyFrame(javafx.util.Duration.seconds(3), ev -> loadPendingBillsForCashier(pendingTable)));
+		pendRefresh.setCycleCount(Timeline.INDEFINITE);
+		pendRefresh.play();
+
 		// Right: totals and actions
 		VBox rightBox = new VBox(12);
 		rightBox.setPadding(new Insets(10));
-		rightBox.setPrefWidth(240);
+		rightBox.setPrefWidth(460);
 		rightBox.getStyleClass().add("stat-card");
 
 		Label totalLabel = new Label("Total: Rs0.00");
@@ -153,11 +240,30 @@ public class CoffeeShopCashier {
 		grandTotal.addListener((obs, oldV, newV) -> totalLabel.setText(String.format("Total: Rs%.2f", newV.doubleValue())));
 
 		Button removeBtn = new Button("Remove Selected");
-		removeBtn.getStyleClass().add("nav-link");
-		Button checkoutBtn = new Button("Checkout");
-		checkoutBtn.getStyleClass().add("logout-button");
+		// Use a specific dark button style for remove action
+		removeBtn.getStyleClass().add("remove-button");
+		Button checkoutBtn = new Button("💳 Checkout");
+		checkoutBtn.getStyleClass().add("pay-button");
 
-		rightBox.getChildren().addAll(totalLabel, removeBtn, checkoutBtn);
+		// Add Table number input for this bill
+		Label tableLabel = new Label("Table #");
+		TextField tableField = new TextField();
+		tableField.setPromptText("Table #");
+		tableField.setPrefWidth(60);
+
+		// align total label to the right inside the rightBox
+		javafx.scene.layout.HBox totalBox = new javafx.scene.layout.HBox(totalLabel);
+		totalBox.setAlignment(Pos.CENTER_RIGHT);
+		totalBox.setMaxWidth(Double.MAX_VALUE);
+		javafx.scene.layout.HBox.setHgrow(totalBox, Priority.ALWAYS);
+		rightBox.getChildren().addAll(tableLabel, tableField, totalBox, removeBtn, checkoutBtn);
+		// add pending orders table below the actions on the right column
+		pendingLabel.getStyleClass().add("card-title");
+		pendingLabel.setMinWidth(Region.USE_PREF_SIZE);
+		pendingTable.setPrefHeight(160);
+		pendingTable.setMaxHeight(220);
+		javafx.scene.layout.VBox.setVgrow(pendingTable, Priority.ALWAYS);
+		centerBox.getChildren().addAll(pendingLabel, pendingTable, refreshPendingBtn);
 
 		// addItem now takes foodId, name, and price
 		java.util.function.Consumer<java.util.AbstractMap.SimpleEntry<Integer, java.util.AbstractMap.SimpleEntry<String, Double>>> addItem = 
@@ -187,8 +293,16 @@ public class CoffeeShopCashier {
 		// Default XAMPP credentials: user=root, password=""
 		try {
 			Class.forName("com.mysql.cj.jdbc.Driver");
-			try (java.sql.Connection conn = java.sql.DriverManager.getConnection(
-					"jdbc:mysql://localhost:3306/restaurant?serverTimezone=UTC", "root", "")) {
+				try (java.sql.Connection conn = java.sql.DriverManager.getConnection(
+						"jdbc:mysql://localhost:3306/restaurant?serverTimezone=UTC", "root", "")) {
+					// Ensure `bills` has the required columns (migration for older DBs)
+					try {
+						com.coffee_shop.model.DbMigration.ensureColumnExists(conn, "bills", "cashier", "VARCHAR(100) DEFAULT NULL");
+						com.coffee_shop.model.DbMigration.ensureColumnExists(conn, "bills", "table_number", "VARCHAR(20) DEFAULT NULL");
+						com.coffee_shop.model.DbMigration.ensureColumnExists(conn, "kitchen_orders", "table_number", "VARCHAR(20) DEFAULT NULL");
+					} catch (Exception ex) {
+						ex.printStackTrace();
+					}
 				String sql = "SELECT id, fName, fPrice FROM food";
 				try (java.sql.PreparedStatement ps = conn.prepareStatement(sql);
 					 java.sql.ResultSet rs = ps.executeQuery()) {
@@ -196,9 +310,48 @@ public class CoffeeShopCashier {
 						int foodId = rs.getInt("id");
 						String name = rs.getString("fName");
 						double price = rs.getDouble("fPrice");
-						Button itemBtn = new Button(String.format("%s - Rs%.2f", name, price));
-						itemBtn.setMaxWidth(Double.MAX_VALUE);
-						itemBtn.getStyleClass().add("nav-link");
+						// Create a more polished tile with optional image, name and price
+						// Create full-width tile button aligned horizontally
+						Button itemBtn = new Button();
+						itemBtn.setPrefHeight(64);
+						itemBtn.setMaxWidth(Double.MAX_VALUE); // fill parent's width
+						itemBtn.getStyleClass().add("item-card");
+						// Tile layout: icon on the left, text name+price to the right
+						javafx.scene.layout.HBox tileBox = new javafx.scene.layout.HBox(12);
+						tileBox.setAlignment(Pos.CENTER_LEFT);
+						tileBox.setPadding(new Insets(6, 12, 6, 12));
+						// small coffee icon for aesthetic
+
+						javafx.scene.control.Label iconLabel = new javafx.scene.control.Label("☕");
+						iconLabel.getStyleClass().add("item-icon");
+
+						// optionally load an image from item_images (name-based or id-based)
+						javafx.scene.image.ImageView iv = null;
+						try {
+							java.io.File imgFile = new java.io.File("item_images" + java.io.File.separator + name.replaceAll("[^a-zA-Z0-9_\\- ]", "_") + ".jpg");
+							if (!imgFile.exists()) imgFile = new java.io.File("item_images" + java.io.File.separator + name.replaceAll("[^a-zA-Z0-9_\\- ]", "_") + ".png");
+								if (imgFile.exists()) {
+									javafx.scene.image.Image img = new javafx.scene.image.Image(imgFile.toURI().toString(), 64, 40, true, true);
+									iv = new javafx.scene.image.ImageView(img);
+									iv.getStyleClass().add("item-image");
+								}
+						} catch (Exception ex) { /* ignore image load errors */ }
+						javafx.scene.layout.VBox textBox = new javafx.scene.layout.VBox(2);
+						textBox.setAlignment(Pos.CENTER_LEFT);
+						javafx.scene.control.Label nameLbl = new javafx.scene.control.Label(name);
+						nameLbl.getStyleClass().add("item-name");
+						javafx.scene.control.Label priceLbl = new javafx.scene.control.Label(String.format("Rs %.2f", price));
+						priceLbl.getStyleClass().add("item-price");
+						textBox.getChildren().addAll(nameLbl, priceLbl);
+						// Add image (if loaded) to the left of text, otherwise use icon
+						if (iv != null) {
+							tileBox.getChildren().addAll(iv, textBox);
+						} else {
+							tileBox.getChildren().addAll(iconLabel, textBox);
+						}
+						itemBtn.setGraphic(tileBox);
+						// store the name for search filter (text nodes might not be picked up)
+						itemBtn.setUserData(name.toLowerCase());
 						final int fId = foodId;
 						final String fName = name;
 						final double fPrice = price;
@@ -206,7 +359,11 @@ public class CoffeeShopCashier {
 							new java.util.AbstractMap.SimpleEntry<>(fId, 
 								new java.util.AbstractMap.SimpleEntry<>(fName, fPrice))
 						));
-						menuBox.getChildren().add(itemBtn);
+						// ensure the button grows horizontally to fill the width of the ScrollPane's content
+						HBox.setHgrow(itemBtn, Priority.ALWAYS);
+						itemBtn.setMaxWidth(Double.MAX_VALUE);
+						flow.getChildren().add(itemBtn);
+						menuButtons.add(itemBtn);
 					}
 				}
 			}
@@ -221,6 +378,19 @@ public class CoffeeShopCashier {
 				cartTable.getItems().remove(sel);
 				double sum = 0; for (CartItem ci : cartTable.getItems()) sum += ci.getTotal();
 				grandTotal.set(sum);
+			}
+		});
+
+		// filter menu items when typing in search box
+		menuSearch.setOnKeyReleased(ev -> {
+			String q = menuSearch.getText();
+			if (q == null) q = "";
+			q = q.trim().toLowerCase();
+			for (Button b : menuButtons) {
+				String txt = (b.getUserData() != null) ? b.getUserData().toString().toLowerCase() : b.getText().toLowerCase();
+				boolean matches = txt.contains(q);
+				b.setVisible(matches);
+				b.setManaged(matches);
 			}
 		});
 
@@ -240,6 +410,9 @@ public class CoffeeShopCashier {
 			StringBuilder sb = new StringBuilder();
 			sb.append("COFFEE SHOP - E-BILL\n");
 			sb.append("Date: ").append(java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))).append("\n");
+			String tno = tableField.getText().trim();
+			if (tno != null && !tno.isEmpty()) sb.append("Table: ").append(tno).append("\n");
+			sb.append("Cashier: ").append(this.currentCashier).append("\n");
 			sb.append("-----------------------------------------------\n");
 			sb.append(String.format("%-30s %5s %10s %10s\n", "Item", "Qty", "Unit", "Total"));
 			sb.append("-----------------------------------------------\n");
@@ -293,20 +466,20 @@ public class CoffeeShopCashier {
 			// Persist bill and items to the database (create tables if needed)
 			try {
 				Class.forName("com.mysql.cj.jdbc.Driver");
-				try (java.sql.Connection conn = java.sql.DriverManager.getConnection(
+					try (java.sql.Connection conn = java.sql.DriverManager.getConnection(
 						"jdbc:mysql://localhost:3306/restaurant?serverTimezone=UTC", "root", "")) {
-/* 
-					String createBills = "CREATE TABLE IF NOT EXISTS bills (id VARCHAR(64) PRIMARY KEY, bill_date DATETIME, total DOUBLE)";
+					String createBills = "CREATE TABLE IF NOT EXISTS bills (id VARCHAR(64) PRIMARY KEY, bill_date DATETIME, total DOUBLE, cashier VARCHAR(100), table_number VARCHAR(20))";
 					String createItems = "CREATE TABLE IF NOT EXISTS bill_items (id INT AUTO_INCREMENT PRIMARY KEY, bill_id VARCHAR(64), food_id INT, qty INT, unit_price DOUBLE, total DOUBLE, FOREIGN KEY(food_id) REFERENCES food(id), INDEX(bill_id))";
 					try (java.sql.Statement s = conn.createStatement()) {
 						s.execute(createBills);
 						s.execute(createItems);
 					}
-*/
-					String insertBill = "INSERT INTO bills (id, bill_date, total) VALUES (?, NOW(), ?)";
+					String insertBill = "INSERT INTO bills (id, bill_date, total, cashier, table_number) VALUES (?, NOW(), ?, ?, ?)";
 					try (java.sql.PreparedStatement ps = conn.prepareStatement(insertBill)) {
 						ps.setString(1, billIdFull);
 						ps.setDouble(2, grandTotal.get());
+						ps.setString(3, this.currentCashier);
+						ps.setString(4, tableField.getText().trim());
 						ps.executeUpdate();
 					}
 
@@ -321,6 +494,26 @@ public class CoffeeShopCashier {
 							psi.addBatch();
 						}
 						psi.executeBatch();
+						// --- START: send items to kitchen_orders ---
+						try {
+							com.coffee_shop.model.KitchenOrdersRepository kitchenRepo = new com.coffee_shop.model.KitchenOrdersRepository();
+							java.util.List<com.coffee_shop.model.KitchenOrdersRepository.OrderItem> items = new java.util.ArrayList<>();
+							for (CartItem ci : cartTable.getItems()) {
+								items.add(new com.coffee_shop.model.KitchenOrdersRepository.OrderItem(ci.getFoodId(), ci.getName(), ci.getQty()));
+							}
+							try {
+								kitchenRepo.insertKitchenOrders(billIdFull, items, tableField.getText().trim());
+								System.out.println("Kitchen orders sent for bill: " + billIdFull);
+							} catch (Exception bun) {
+								// If the kitchen write fails, we log but do not stop the bill
+								System.err.println("Could not send kitchen orders for bill " + billIdFull + ": " + bun.getMessage());
+								bun.printStackTrace();
+							}
+						} catch (Exception kitchenEx) {
+							kitchenEx.printStackTrace();
+						}
+// --- END: send items to kitchen_orders ---
+
 					} 
 				}
 			} catch (Exception ex) {
@@ -388,17 +581,18 @@ public class CoffeeShopCashier {
 
 			closeBtn.setOnAction(ev -> {
 				billStage.close();
-				// clear cart after closing popup
+				// clear cart after closing popup (we keep a pending list in the cashier dashboard)
 				cartTable.getItems().clear();
 				grandTotal.set(0);
 			});
 		});
 
-		// Compose layout
-		BorderPane content = new BorderPane();
-		content.setLeft(menuBox);
-		content.setCenter(centerBox);
-		content.setRight(rightBox);
+		// Compose layout: use HBox as main content (menu | center | right) so rightBox sits flush to the window's right edge
+		javafx.scene.layout.HBox content = new javafx.scene.layout.HBox();
+		content.getChildren().addAll(menuBox, centerBox, rightBox);
+		content.setSpacing(0);
+		// Allow centerBox to expand and push the rightBox to the edge
+		javafx.scene.layout.HBox.setHgrow(centerBox, javafx.scene.layout.Priority.ALWAYS);
 
 		root.setTop(topBar);
 		root.setCenter(content);
@@ -414,5 +608,28 @@ public class CoffeeShopCashier {
 		stage.setTitle("Coffee Shop POS - Cashier");
 		stage.setScene(scene);
 		stage.show();
+	}
+
+	private void loadPendingBillsForCashier(javafx.scene.control.TableView<java.util.Map<String, Object>> pendingTable) {
+		java.util.List<java.util.Map<String, Object>> rows = new java.util.ArrayList<>();
+		String sql = "SELECT b.id, b.total, b.table_number, SUM(CASE WHEN ko.status = 'PENDING' THEN 1 ELSE 0 END) as pending FROM bills b JOIN kitchen_orders ko ON ko.bill_id=b.id WHERE b.cashier = ? GROUP BY b.id, b.total, b.table_number HAVING pending > 0";
+		try (Connection c = DriverManager.getConnection("jdbc:mysql://localhost:3306/restaurant?serverTimezone=UTC", "root", "")) {
+			try (PreparedStatement ps = c.prepareStatement(sql)) {
+				ps.setString(1, this.currentCashier);
+				try (ResultSet rs = ps.executeQuery()) {
+					while (rs.next()) {
+						java.util.Map<String, Object> m = new java.util.HashMap<>();
+						m.put("id", rs.getString("id"));
+						m.put("total", rs.getDouble("total"));
+						m.put("table_number", rs.getString("table_number"));
+						m.put("pending", rs.getInt("pending"));
+						rows.add(m);
+					}
+				}
+			}
+		} catch (Exception ex) {
+			ex.printStackTrace();
+		}
+		pendingTable.getItems().setAll(rows);
 	}
 }
